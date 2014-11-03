@@ -542,8 +542,51 @@ public class RemoteBuildConfiguration extends Builder {
         }
 
         listener.getLogger().println("Triggering remote job now.");
-        sendHTTPCall(triggerUrlString, "POST", build, listener);
+        Holder<URL> urlHolder = new Holder<URL>();
+        sendHTTPCall(triggerUrlString, "POST", build, listener, 1, urlHolder);
+        if (urlHolder.get() != null) {
+            String queueUrlString = urlHolder.get().toExternalForm();
+
+            int attempts = 0, failCount = 0;
+            while (true) {
+                attempts++;
+                listener.getLogger().println("Attempt #" + attempts);
+
+                JSONObject queueResponseObject = sendHTTPCall(queueUrlString, "GET", build, listener);
+                if (queueResponseObject == null) {
+                    failCount++;
+                    listener.getLogger().println("Attempt failed.");
+                    if (failCount > 10) {
+                        this.failBuild(new Exception("Exceeded max number of failures."), listener);
+                        return true;
+                    }
+                }
+
+                if (queueResponseObject.containsKey("executable")) {
+                    // Build number has been assigned!
+                    nextBuildNumber = queueResponseObject.getJSONObject("executable").getInt("number");
+                    break;
+                }
+
+                if (queueResponseObject.has("cancelled") && queueResponseObject.getBoolean("cancelled")) {
+                    this.failBuild(new Exception("Remote build was cancelled while queued."), listener);
+                    return true;
+                }
+
+                listener.getLogger().println("Connection to remote server failed, waiting for to retry - " + this.pollInterval + " seconds until next attempt.");
+
+                // Sleep for 'pollInterval' seconds.
+                // Sleep takes miliseconds so need to convert this.pollInterval to milisecopnds (x 1000)
+                try {
+                    // Could do with a better way of sleeping...
+                    Thread.sleep(this.pollInterval * 1000);
+                } catch (InterruptedException ex) {
+                    this.failBuild(ex, listener);
+                }
+            }
+        } else {
         // Validate the build number via parameters
+        listener.getLogger().println("Using unreliable build checker. Upgrade remote server to Jenkins v1.561 to use the reliable checker.");
         foundIt: for (int tries = 3; tries > 0; tries--) {
             for (int buildNumber : new SearchPattern(nextBuildNumber, 2)) {
                 listener.getLogger().println("Checking parameters of #" + buildNumber);
@@ -578,6 +621,7 @@ public class RemoteBuildConfiguration extends Builder {
                     this.failBuild(e, listener);
                 }
             }
+        }
         }
         listener.getLogger().println("This job is build #[" + Integer.toString(nextBuildNumber) + "] on the remote server.");
         BuildInfoExporterAction.addBuildInfoExporterAction(build, jobName, nextBuildNumber, Result.NOT_BUILT);
@@ -740,8 +784,7 @@ public class RemoteBuildConfiguration extends Builder {
      */
     public JSONObject sendHTTPCall(String urlString, String requestType, AbstractBuild build, BuildListener listener)
             throws IOException {
-        
-            return sendHTTPCall( urlString, requestType, build, listener, 1 );
+        return sendHTTPCall( urlString, requestType, build, listener, 1, null );
     }
 
     /**
@@ -755,6 +798,11 @@ public class RemoteBuildConfiguration extends Builder {
      * @throws IOException
      */
     public JSONObject sendHTTPCall(String urlString, String requestType, AbstractBuild build, BuildListener listener, int numberOfAttempts)
+            throws IOException {
+        return sendHTTPCall( urlString, requestType, build, listener, numberOfAttempts, null );
+    }
+
+    private JSONObject sendHTTPCall(String urlString, String requestType, AbstractBuild build, BuildListener listener, int numberOfAttempts, Holder<URL> urlHolder)
             throws IOException {
         RemoteJenkinsServer remoteServer = this.findRemoteHost(this.getRemoteJenkinsName());
         int retryLimit = this.getConnectionRetryLimit();
@@ -805,6 +853,15 @@ public class RemoteBuildConfiguration extends Builder {
             
             InputStream is = connection.getInputStream();
             
+            if (urlHolder != null) {
+                if (buildUrl.equals(connection.getURL())) {
+                    listener.getLogger().println("URLs look the same!");
+                } else {
+                    listener.getLogger().println("Redirected URL" + connection.getURL());
+                    urlHolder.set(connection.getURL());
+                }
+            }
+
             BufferedReader rd = new BufferedReader(new InputStreamReader(is));
             String line;
             // String response = "";
